@@ -1,0 +1,6 @@
+# raw Facebook export (contains messages, ads data, etc. — never commit)
+*.zip
+raw/
+
+.DS_Store
+__pycache__/
