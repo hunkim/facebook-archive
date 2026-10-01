@@ -10,6 +10,7 @@ Sung Kim(@hunkims)의 Facebook 글과 사진 아카이브. 원본은 Facebook "�
 | `YYYY/README.md` | 그해 월별 표. `summary` 마커 사이의 요약은 다시 생성해도 유지된다 |
 | `YYYY/media/` | 원본 이미지 (동영상은 제외) |
 | `index.jsonl` | 항목 하나에 한 줄 (`file#anchor` 포함). LLM 컨텍스트, 검색, RAG에 쓴다 |
+| `captions.jsonl` | 이미지별 한국어 비전 캡션 (`path`, `caption`). `scripts/fb_to_md.py --clean`으로 MD를 다시 만들어도 이 파일은 유지되며, `scripts/caption_images.py --apply-only`로 MD/`index.jsonl`에 다시 넣을 수 있다 |
 
 게시물에 붙지 않은 사진(모바일 업로드, 앨범)은 날짜별로 묶어 `📷` 항목으로, 다른 사람 타임라인에 남긴 글은 `↪` 항목으로 넣는다. 시간은 KST 기준이다.
 
@@ -24,6 +25,19 @@ python3 scripts/fb_to_md.py --clean
 ```
 
 이미 압축을 푼 폴더가 있으면 `--raw ~/Downloads/your_facebook_activity`로 그 폴더를 지정한다.
+
+
+## 이미지 캡션
+
+월별 MD의 각 `<img>` 바로 아래에 `**이미지 캡션:** …` 형태로 한국어 설명을 둔다. 원본은 `captions.jsonl`에 있어 `--clean` 재생성 후에도 복구할 수 있다.
+
+```bash
+# 캡션 생성/재개 (이미 captions.jsonl에 있는 path는 건너뜀)
+python3 scripts/caption_images.py
+
+# captions.jsonl → MD / index.jsonl 재적용만
+python3 scripts/caption_images.py --apply-only
+```
 
 <!-- timeline:start -->
 ## Timeline
