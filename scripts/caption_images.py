@@ -28,6 +28,15 @@ INDEX_PATH = REPO / "index.jsonl"
 
 IMG_TAG_RE = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
 SRC_RE = re.compile(r"""src=["']([^"']+)["']""", re.IGNORECASE)
+
+
+def resolve_media_path(year_dir: Path, src: str) -> str:
+    """Resolve img src (may be ../YYYY/media/...) to repo-relative path."""
+    try:
+        return str((year_dir / src).resolve().relative_to(REPO.resolve())).replace("\\", "/")
+    except Exception:
+        return f"{year_dir.name}/{src.lstrip('./')}".replace("\\", "/")
+
 CAPTION_AFTER_RE = re.compile(
     r"(<img\b[^>]*>)([ \t]*\n?[ \t]*)(\*\*이미지 캡션:\*\*[^\n]*)",
     re.IGNORECASE,
@@ -213,10 +222,7 @@ def collect_jobs(years: list[str] | None = None) -> list[dict]:
                 src = sm.group(1)
                 # relative to year folder
                 img_path = (ydir / src).resolve()
-                rel = f"{ydir.name}/{src.lstrip('./')}"
-                # normalize media path
-                if not rel.startswith(ydir.name + "/"):
-                    rel = f"{ydir.name}/{src}"
+                rel = resolve_media_path(ydir, src)
                 # Check if caption already immediately after this tag in MD
                 after = text[m.end() : m.end() + 80]
                 has_md_cap = bool(re.match(r"\s*\*\*이미지 캡션:\*\*", after))
@@ -261,7 +267,7 @@ def apply_captions_to_md(captions: dict[str, str], years: list[str] | None = Non
                     pos = m.end()
                     continue
                 src = sm.group(1)
-                rel = f"{ydir.name}/{src.lstrip('./')}".replace("\\", "/")
+                rel = resolve_media_path(ydir, src)
                 cap = captions.get(rel)
                 if not cap:
                     pos = m.end()
