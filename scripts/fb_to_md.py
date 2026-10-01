@@ -1,30 +1,35 @@
 #!/usr/bin/env python3
-"""Convert a Facebook "Download Your Information" JSON export into Markdown.
+"""Convert a Facebook "Download Your Information" JSON export into monthly Markdown.
 
 Usage:
-    python3 scripts/fb_to_md.py            # unzip ./*.zip into raw/, then convert
-    python3 scripts/fb_to_md.py --raw DIR  # convert an already-extracted export
+    python3 scripts/fb_to_md.py --raw ~/Downloads   # dir containing your_facebook_activity/
+    python3 scripts/fb_to_md.py                     # unzip ./*.zip into raw/, then convert
 
 Output (repo root):
-    posts/YYYY/YYYY-MM-DD-HHMM-<slug>.md   one file per post, YAML front matter
-    albums/<album>.md                      album pages
-    media/YYYY/<file>                      images (videos skipped)
-    index.jsonl                            one JSON line per post (for LLM/search)
-    TIMELINE.md                            generated table of contents by year
+    YYYY/YYYY-MM.md      one diary-style file per month (posts + photos, chronological)
+    YYYY/README.md       month table for the year (room for a written summary)
+    YYYY/media/          original images (videos skipped)
+    index.jsonl          one JSON line per entry, with file#anchor (for LLM/search)
+    README.md            timeline section regenerated between markers
 """
 
 import argparse
 import datetime as dt
 import json
+import os
 import re
 import shutil
 import sys
 import zipfile
+from collections import defaultdict
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".bmp"}
-TZ = dt.timezone(dt.timedelta(hours=9))  # KST; change if needed
+TZ = dt.timezone(dt.timedelta(hours=9))  # KST
+MENTION = re.compile(r"@\[\d+:\d+:([^\]]+)\]")  # @[id:2048:Name] -> Name
+WEEKDAY = "월화수목금토일"
+WIDTH_ONE, WIDTH_MANY, WIDTH_THUMB = 480, 300, 200
 
 
 # ---------- helpers ----------
@@ -41,7 +46,7 @@ def fix(s):
 
 def fix_all(obj):
     if isinstance(obj, str):
-        return fix(obj)
+        return MENTION.sub(r"\1", fix(obj))
     if isinstance(obj, list):
         return [fix_all(x) for x in obj]
     if isinstance(obj, dict):
@@ -54,27 +59,19 @@ def load_json(path):
         return fix_all(json.load(f))
 
 
-def slugify(text, n=40):
-    text = re.sub(r"https?://\S+", "", text or "")
-    text = re.sub(r"[^\w\s가-힣-]", "", text)
-    text = re.sub(r"\s+", "-", text.strip())
-    return text[:n].strip("-").lower() or "post"
-
-
-def yaml_str(s):
-    return json.dumps(s, ensure_ascii=False)  # JSON strings are valid YAML
-
-
 def to_dt(ts):
     return dt.datetime.fromtimestamp(ts, TZ)
 
 
-# ---------- extraction ----------
+def headline(text, n=40):
+    line = re.sub(r"https?://\S+", "", text or "").strip().split("\n")[0].strip()
+    return line[:n] + ("…" if len(line) > n else "")
+
+
+# ---------- export discovery ----------
 
 def unzip_all(raw):
     zips = sorted(ROOT.glob("*.zip"))
-    if not zips:
-        return
     raw.mkdir(exist_ok=True)
     for z in zips:
         marker = raw / f".done-{z.name}"
@@ -87,251 +84,309 @@ def unzip_all(raw):
 
 
 def find_export_root(raw):
-    """Directory whose children include 'your_facebook_activity' or 'posts'."""
-    for name in ("your_facebook_activity", "posts"):
-        hits = sorted(raw.rglob(name), key=lambda p: len(p.parts))
-        for h in hits:
-            if h.is_dir():
-                return h.parent
-    sys.exit(f"Facebook export not found under {raw}")
+    """Directory that contains your_facebook_activity/ (URIs are relative to it)."""
+    raw = raw.expanduser().resolve()
+    if raw.name == "your_facebook_activity":
+        return raw.parent
+    hits = sorted(raw.rglob("your_facebook_activity"), key=lambda p: len(p.parts))
+    for h in hits:
+        if h.is_dir() and (h / "posts").is_dir():
+            return h.parent
+    sys.exit(f"your_facebook_activity/ not found under {raw}")
 
 
-class MediaResolver:
-    def __init__(self, root):
-        self.root = root
+class Media:
+    """Resolves export URIs and copies images to YYYY/media/ once."""
+
+    def __init__(self, root, stats):
+        self.root, self.stats = root, stats
         self.by_name = None
+        self.copied = {}  # uri -> repo-relative path
 
     def find(self, uri):
         p = self.root / uri
         if p.exists():
             return p
-        if self.by_name is None:  # lazy basename index for odd layouts
+        if self.by_name is None:
             self.by_name = {f.name: f for f in self.root.rglob("*") if f.is_file()}
         return self.by_name.get(Path(uri).name)
 
+    def is_image(self, uri):
+        return Path(uri).suffix.lower() in IMAGE_EXT
 
-def post_files(root):
-    pats = ["**/posts/your_posts*.json", "**/posts/your_posts__check_ins__photos_and_videos*.json"]
-    seen = set()
-    for pat in pats:
-        for f in sorted(root.glob(pat)):
-            if f not in seen:
-                seen.add(f)
-                yield f
-
-
-def parse_post(p):
-    text_parts, updated = [], None
-    for d in p.get("data", []):
-        if d.get("post"):
-            text_parts.append(d["post"])
-        if d.get("update_timestamp"):
-            updated = d["update_timestamp"]
-
-    media, links, places, extra_text = [], [], [], []
-    for att in p.get("attachments", []):
-        for d in att.get("data", []):
-            if "media" in d:
-                m = d["media"]
-                media.append({
-                    "uri": m.get("uri", ""),
-                    "ts": m.get("creation_timestamp"),
-                    "description": m.get("description") or m.get("title") or "",
-                })
-            if "external_context" in d:
-                url = d["external_context"].get("url")
-                if url:
-                    links.append(url)
-            if "place" in d:
-                places.append(d["place"].get("name", ""))
-            if "text" in d and d["text"]:
-                extra_text.append(d["text"])
-
-    return {
-        "timestamp": p.get("timestamp") or (media[0]["ts"] if media else None),
-        "updated": updated,
-        "title": p.get("title", ""),
-        "text": "\n\n".join(text_parts + extra_text).strip(),
-        "media": media,
-        "links": links,
-        "places": [x for x in places if x],
-        "tags": [t.get("name", t) if isinstance(t, dict) else t for t in p.get("tags", [])],
-    }
+    def copy(self, uri, ts):
+        if uri in self.copied:
+            return self.copied[uri]
+        src = self.find(uri)
+        if src is None:
+            self.stats["missing_media"] += 1
+            return None
+        d = to_dt(ts)
+        rel = Path(str(d.year)) / "media" / f"{d:%Y-%m-%d}_{src.name}"
+        dst = ROOT / rel
+        if not dst.exists():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+        self.stats["images"] += 1
+        self.copied[uri] = rel.as_posix()
+        return self.copied[uri]
 
 
-# ---------- output ----------
+# ---------- parsing ----------
+# Entry: {ts, kind, text, photos:[{uri, desc}], videos:int, links, places, label}
 
-def copy_media(item, year, resolver, stats):
-    src = resolver.find(item["uri"])
-    if src is None:
-        stats["missing_media"] += 1
-        return None
-    if src.suffix.lower() not in IMAGE_EXT:
-        stats["skipped_video"] += 1
-        return None
-    rel = Path("media") / str(year) / src.name
-    dst = ROOT / rel
-    if not dst.exists():
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dst)
-        stats["images"] += 1
-    return rel.as_posix()
-
-
-def write_post(post, resolver, stats, used_names):
-    d = to_dt(post["timestamp"])
-    images = []
-    for m in post["media"]:
-        rel = copy_media(m, d.year, resolver, stats)
-        if rel:
-            images.append({"path": rel, "description": m["description"]})
-
-    if not post["text"] and not images and not post["links"] and not post["places"]:
-        stats["empty"] += 1
-        return None
-
-    base = f"{d:%Y-%m-%d-%H%M}-{slugify(post['text'] or post['title'])}"
-    name, i = base, 2
-    while name in used_names:
-        name, i = f"{base}-{i}", i + 1
-    used_names.add(name)
-    rel = Path("posts") / str(d.year) / f"{name}.md"
-
-    fm = ["---", f"date: {d.isoformat()}"]
-    if post["updated"]:
-        fm.append(f"updated: {to_dt(post['updated']).isoformat()}")
-    if post["title"]:
-        fm.append(f"fb_title: {yaml_str(post['title'])}")
-    for key in ("places", "tags", "links"):
-        if post[key]:
-            fm.append(f"{key}: [{', '.join(yaml_str(x) for x in post[key])}]")
-    if images:
-        fm.append(f"images: [{', '.join(yaml_str(x['path']) for x in images)}]")
-    fm.append("---")
-
-    body = [post["text"]] if post["text"] else []
-    for img in images:
-        alt = img["description"].replace("\n", " ")[:100]
-        body.append(f"![{alt}](../../{img['path']})")
-        if img["description"] and img["description"] != post["text"]:
-            body.append(f"> {img['description']}")
-    for url in post["links"]:
-        if url not in post["text"]:
-            body.append(f"<{url}>")
-
-    out = ROOT / rel
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text("\n".join(fm) + "\n\n" + "\n\n".join(body) + "\n", encoding="utf-8")
-    stats["posts"] += 1
-
-    return {
-        "date": d.isoformat(),
-        "file": rel.as_posix(),
-        "text": post["text"],
-        "images": [x["path"] for x in images],
-        "links": post["links"],
-        "places": post["places"],
-        "tags": post["tags"],
-    }
-
-
-def write_albums(root, resolver, stats):
-    rows = []
-    for f in sorted(root.glob("**/posts/album/*.json")):
-        album = load_json(f)
-        photos = album.get("photos", [])
-        name = album.get("name") or f.stem
-        lines = [f"# {name}", ""]
-        if album.get("description"):
-            lines += [album["description"], ""]
-        for ph in photos:
-            ts = ph.get("creation_timestamp") or album.get("last_modified_timestamp") or 0
-            rel = copy_media({"uri": ph.get("uri", "")}, to_dt(ts).year, resolver, stats)
-            if not rel:
+def parse_posts(posts_dir):
+    entries, seen = [], set()
+    for f in sorted(posts_dir.glob("your_posts*.json")):
+        data = load_json(f)
+        if isinstance(data, dict):
+            data = next((v for v in data.values() if isinstance(v, list)), [])
+        for p in data:
+            texts, photos, videos, links, places = [], [], 0, [], []
+            for d in p.get("data", []):
+                if d.get("post"):
+                    texts.append(d["post"])
+            for att in p.get("attachments", []):
+                for d in att.get("data", []):
+                    if "media" in d:
+                        m = d["media"]
+                        uri = m.get("uri", "")
+                        if Path(uri).suffix.lower() in IMAGE_EXT:
+                            desc = m.get("description") or ""
+                            photos.append({"uri": uri, "desc": desc, "ts": m.get("creation_timestamp")})
+                        else:
+                            videos += 1
+                            if m.get("description"):
+                                texts.append(m["description"])
+                    if d.get("external_context", {}).get("url"):
+                        links.append(d["external_context"]["url"])
+                    if d.get("place", {}).get("name"):
+                        places.append(d["place"]["name"])
+                    if d.get("text"):
+                        texts.append(d["text"])
+            ts = p.get("timestamp") or next((x["ts"] for x in photos if x["ts"]), None)
+            if not ts:
                 continue
-            desc = (ph.get("description") or ph.get("title") or "").strip()
-            lines.append(f"![{desc[:100]}](../{rel})")
-            if desc:
-                lines.append(f"> {desc}")
-            lines.append("")
-        out = ROOT / "albums" / f"{slugify(name, 60)}-{f.stem}.md"
-        out.parent.mkdir(exist_ok=True)
-        out.write_text("\n".join(lines), encoding="utf-8")
-        rows.append((name, out.relative_to(ROOT).as_posix(), len(photos)))
-        stats["albums"] += 1
-    return rows
+            text = "\n\n".join(dict.fromkeys(t.strip() for t in texts if t.strip()))
+            key = (ts, text, tuple(x["uri"] for x in photos))
+            if key in seen:
+                continue
+            seen.add(key)
+            if not (text or photos or videos or links or places):
+                continue
+            entries.append(dict(ts=ts, kind="post", text=text, photos=photos, videos=videos,
+                                links=links, places=places, label=p.get("title", "")))
+    return entries
 
 
-def write_timeline(entries, albums):
-    by_year = {}
-    for e in entries:
-        by_year.setdefault(e["date"][:4], []).append(e)
-    lines = ["# Facebook Timeline", "",
-             f"{len(entries)} posts · {sum(len(e['images']) for e in entries)} images · "
-             f"{min(by_year, default='-')}–{max(by_year, default='-')}", ""]
-    lines += [" · ".join(f"[{y}](#{y}) ({len(by_year[y])})" for y in sorted(by_year, reverse=True)), ""]
-    for y in sorted(by_year, reverse=True):
-        lines += [f"## {y}", ""]
-        for e in by_year[y]:
-            preview = re.sub(r"\s+", " ", e["text"])[:80] or "(photo)"
-            pic = " 📷" if e["images"] else ""
-            lines.append(f"- {e['date'][:10]} [{preview}]({e['file']}){pic}")
+def label_value(p, name):
+    for lv in p.get("label_values", []):
+        if lv.get("label") == name:
+            return lv.get("value") or ""
+    return ""
+
+
+def parse_other_pages(posts_dir):
+    f = posts_dir / "posts_on_other_pages_and_profiles.json"
+    if not f.exists():
+        return []
+    out = []
+    for p in load_json(f):
+        msg = label_value(p, "Message").strip()
+        if not msg:
+            continue
+        target = label_value(p, "Target")
+        out.append(dict(ts=p["timestamp"], kind="other", text=msg, photos=[], videos=0, links=[],
+                        places=[], label=f"다른 프로필에 남긴 글{' → ' + target if target else ''}"))
+    return out
+
+
+def parse_loose_photos(posts_dir, used_uris):
+    """Photos not attached to any post: uncategorized + album photos, grouped by (source, day)."""
+    groups = defaultdict(list)
+
+    f = posts_dir / "your_uncategorized_photos.json"
+    if f.exists():
+        data = load_json(f)
+        for ph in data.get("other_photos_v2", []) if isinstance(data, dict) else data:
+            if ph.get("uri") in used_uris or not ph.get("creation_timestamp"):
+                continue
+            day = to_dt(ph["creation_timestamp"]).date()
+            groups[("사진", day)].append(ph)
+
+    for af in sorted(posts_dir.glob("album/*.json"), key=lambda p: int(p.stem) if p.stem.isdigit() else 0):
+        album = load_json(af)
+        for ph in album.get("photos", []):
+            ts = ph.get("creation_timestamp") or album.get("last_modified_timestamp")
+            if ph.get("uri") in used_uris or not ts:
+                continue
+            ph = {**ph, "creation_timestamp": ts}
+            groups[(f"앨범: {album.get('name', af.stem)}", to_dt(ts).date())].append(ph)
+
+    out = []
+    for (label, _), phs in groups.items():
+        phs.sort(key=lambda x: x["creation_timestamp"])
+        photos = [{"uri": x["uri"], "desc": x.get("description") or "", "ts": x["creation_timestamp"]}
+                  for x in phs if Path(x["uri"]).suffix.lower() in IMAGE_EXT]
+        if photos:
+            out.append(dict(ts=phs[0]["creation_timestamp"], kind="photos", text="", photos=photos,
+                            videos=0, links=[], places=[], label=label))
+    return out
+
+
+# ---------- rendering ----------
+
+def render_entry(e, media, anchor):
+    d = to_dt(e["ts"])
+    when = f"{d.month}월 {d.day}일 ({WEEKDAY[d.weekday()]}) {d:%H:%M}"
+    if e["kind"] == "photos":
+        title = f"📷 {e['label']} ({len(e['photos'])}장)"
+    elif e["kind"] == "other":
+        title = f"↪ {headline(e['text'])}"
+    else:
+        title = headline(e["text"]) or ("📷 사진" if e["photos"] else e["label"] or "게시물")
+
+    lines = [f'<a id="{anchor}"></a>', f"### {when} · {title}", ""]
+    if e["kind"] == "other":
+        lines += [f"*{e['label']}*", ""]
+    if e["places"]:
+        lines += [f"📍 {', '.join(e['places'])}", ""]
+    if e["text"]:
+        lines += [e["text"], ""]
+
+    paths = []
+    for ph in e["photos"]:
+        rel = media.copy(ph["uri"], ph.get("ts") or e["ts"])
+        if rel:
+            paths.append((os.path.relpath(rel, str(d.year)), ph["desc"], rel))
+    if paths:
+        w = WIDTH_THUMB if e["kind"] == "photos" else WIDTH_ONE if len(paths) == 1 else WIDTH_MANY
+        lines.append(" ".join(
+            f'<img src="{p}" width="{w}" alt="{desc[:80].replace(chr(34), "").replace(chr(10), " ")}">'
+            for p, desc, _ in paths))
         lines.append("")
-    if albums:
-        lines += ["## Albums", ""]
-        lines += [f"- [{n}]({p}) ({c})" for n, p, c in albums]
-    (ROOT / "TIMELINE.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        captions = [desc for _, desc, _ in paths if desc.strip() and desc.strip() not in e["text"]]
+        lines += [f"> {c.replace(chr(10), ' ')}" for c in dict.fromkeys(captions)]
+        if captions:
+            lines.append("")
+    if e["videos"]:
+        lines += [f"🎬 동영상 {e['videos']}개 (생략)", ""]
+    for url in e["links"]:
+        if url not in e["text"]:
+            lines += [f"🔗 <{url}>", ""]
+
+    return lines, [rel for _, _, rel in paths]
+
+
+def write_month(ym, entries, media, index):
+    year, month = ym
+    rel = Path(str(year)) / f"{year}-{month:02d}.md"
+    body, n_img, used = [], 0, set()
+    for e in entries:
+        d = to_dt(e["ts"])
+        anchor, i = f"p{d:%m%d-%H%M}", 2
+        while anchor in used:
+            anchor, i = f"p{d:%m%d-%H%M}-{i}", i + 1
+        used.add(anchor)
+        lines, imgs = render_entry(e, media, anchor)
+        body += lines + [""]
+        n_img += len(imgs)
+        index.append({
+            "date": d.isoformat(), "kind": e["kind"], "file": f"{rel.as_posix()}#{anchor}",
+            "text": e["text"], "images": imgs, "videos": e["videos"],
+            "links": e["links"], "places": e["places"], "label": e["label"],
+        })
+    n_posts = sum(1 for e in entries if e["kind"] != "photos")
+    head = ["---", f"month: {year}-{month:02d}", f"entries: {len(entries)}",
+            f"posts: {n_posts}", f"images: {n_img}", "---", "",
+            f"# {year}년 {month}월", "", f"[← {year}년](README.md)", ""]
+    (ROOT / rel).parent.mkdir(parents=True, exist_ok=True)
+    (ROOT / rel).write_text("\n".join(head + body).rstrip() + "\n", encoding="utf-8")
+    first = next((headline(e["text"], 50) for e in entries if e["text"]), "")
+    return dict(year=year, month=month, file=rel.name, posts=n_posts, images=n_img, first=first)
+
+
+def write_year_readme(year, months):
+    path = ROOT / str(year) / "README.md"
+    summary = ""
+    if path.exists():  # keep a hand/LLM-written summary between markers
+        m = re.search(r"<!-- summary:start -->\n(.*?)<!-- summary:end -->", path.read_text(), re.S)
+        summary = m.group(1) if m else ""
+    lines = [f"# {year}", "", "<!-- summary:start -->", summary.rstrip() or "_(요약 예정)_",
+             "<!-- summary:end -->", "", "| 월 | 글 | 사진 | 첫 글 |", "|---|---:|---:|---|"]
+    for m in months:
+        lines.append(f"| [{m['month']}월]({m['file']}) | {m['posts']} | {m['images']} | {m['first']} |")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def write_root_readme(by_year):
+    path = ROOT / "README.md"
+    text = path.read_text(encoding="utf-8") if path.exists() else "# facebook-archive\n"
+    total_p = sum(m["posts"] for ms in by_year.values() for m in ms)
+    total_i = sum(m["images"] for ms in by_year.values() for m in ms)
+    lines = ["<!-- timeline:start -->", "## Timeline", "",
+             f"{min(by_year)}–{max(by_year)} · 글 {total_p:,}개 · 사진 {total_i:,}장", "",
+             "| 연도 | 글 | 사진 | 월 |", "|---|---:|---:|---|"]
+    for y in sorted(by_year, reverse=True):
+        ms = by_year[y]
+        links = " ".join(f"[{m['month']}]({y}/{m['file']})" for m in ms)
+        lines.append(f"| [{y}]({y}/README.md) | {sum(m['posts'] for m in ms)} | "
+                     f"{sum(m['images'] for m in ms)} | {links} |")
+    lines.append("<!-- timeline:end -->")
+    block = "\n".join(lines)
+    if "<!-- timeline:start -->" in text:
+        text = re.sub(r"<!-- timeline:start -->.*<!-- timeline:end -->", lambda _: block, text, flags=re.S)
+    else:
+        text = text.rstrip() + "\n\n" + block + "\n"
+    path.write_text(text, encoding="utf-8")
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--raw", type=Path, default=ROOT / "raw")
-    ap.add_argument("--clean", action="store_true", help="delete posts/ albums/ media/ first")
+    ap.add_argument("--clean", action="store_true", help="delete generated YYYY/ dirs first (keeps summaries)")
     args = ap.parse_args()
 
     if args.raw == ROOT / "raw":
         unzip_all(args.raw)
-    export_root = find_export_root(args.raw)
-    print(f"export root: {export_root}")
+    root = find_export_root(args.raw)
+    posts_dir = root / "your_facebook_activity" / "posts"
+    print(f"export: {posts_dir}")
 
     if args.clean:
-        for d in ("posts", "albums", "media"):
-            shutil.rmtree(ROOT / d, ignore_errors=True)
+        for d in ROOT.glob("[12][0-9][0-9][0-9]"):
+            for f in d.iterdir():
+                if f.name != "README.md":
+                    shutil.rmtree(f) if f.is_dir() else f.unlink()
 
-    resolver = MediaResolver(export_root)
-    stats = dict(posts=0, images=0, albums=0, empty=0, dupes=0, skipped_video=0, missing_media=0)
+    stats = defaultdict(int)
+    media = Media(root, stats)
 
-    raw_posts, seen = [], set()
-    for f in post_files(export_root):
-        data = load_json(f)
-        if isinstance(data, dict):  # older exports wrap the list
-            data = next((v for v in data.values() if isinstance(v, list)), [])
-        for p in data:
-            post = parse_post(p)
-            if not post["timestamp"]:
-                continue
-            key = (post["timestamp"], post["text"], tuple(m["uri"] for m in post["media"]))
-            if key in seen:
-                stats["dupes"] += 1
-                continue
-            seen.add(key)
-            raw_posts.append(post)
+    posts = parse_posts(posts_dir)
+    used = {ph["uri"] for e in posts for ph in e["photos"]}
+    entries = posts + parse_other_pages(posts_dir) + parse_loose_photos(posts_dir, used)
+    entries.sort(key=lambda e: e["ts"])
+    for e in entries:
+        stats[e["kind"]] += 1
 
-    raw_posts.sort(key=lambda p: p["timestamp"])
-    used, entries = set(), []
-    for post in raw_posts:
-        e = write_post(post, resolver, stats, used)
-        if e:
-            entries.append(e)
+    by_month = defaultdict(list)
+    for e in entries:
+        d = to_dt(e["ts"])
+        by_month[(d.year, d.month)].append(e)
 
-    albums = write_albums(export_root, resolver, stats)
+    index, by_year = [], defaultdict(list)
+    for ym in sorted(by_month):
+        by_year[ym[0]].append(write_month(ym, by_month[ym], media, index))
+    for y, ms in by_year.items():
+        write_year_readme(y, ms)
+    write_root_readme(by_year)
 
     with open(ROOT / "index.jsonl", "w", encoding="utf-8") as f:
-        for e in entries:
-            f.write(json.dumps(e, ensure_ascii=False) + "\n")
-    write_timeline(entries, albums)
+        for row in index:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
-    print(json.dumps(stats, indent=2))
+    stats["months"] = len(by_month)
+    print(json.dumps(dict(stats), indent=2))
 
 
 if __name__ == "__main__":
